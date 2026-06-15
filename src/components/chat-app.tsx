@@ -10,9 +10,12 @@ import {
 import {
   Check,
   Copy,
+  Download,
+  Globe,
   Menu,
   MessageSquarePlus,
   Moon,
+  Paperclip,
   Pencil,
   RotateCcw,
   Send,
@@ -32,11 +35,14 @@ import {
   type ModelId,
 } from "@/lib/models";
 import { ERROR_SENTINEL, STORAGE } from "@/lib/constants";
-import type { ChatMessage, Conversation } from "@/lib/types";
+import { ALLOWED_IMAGE_TYPES, fileToImageData, imageSrc } from "@/lib/image";
+import type { ChatMessage, Conversation, ImageData } from "@/lib/types";
 
 const uid = () =>
-  (globalThis.crypto?.randomUUID?.() ??
-    Date.now().toString(36) + Math.random().toString(36).slice(2));
+  globalThis.crypto?.randomUUID?.() ??
+  Date.now().toString(36) + Math.random().toString(36).slice(2);
+
+const MAX_ATTACHMENTS = 4;
 
 const SUGGESTIONS = [
   {
@@ -61,7 +67,16 @@ const SUGGESTIONS = [
 
 function deriveTitle(text: string) {
   const t = text.trim().replace(/\s+/g, " ");
-  return t.length > 48 ? t.slice(0, 48) + "…" : t || "New chat";
+  if (!t) return "New chat";
+  return t.length > 48 ? t.slice(0, 48) + "…" : t;
+}
+
+type ApiMessage = { role: "user" | "assistant"; content: string; images?: ImageData[] };
+
+function toApi(msgs: ChatMessage[]): ApiMessage[] {
+  return msgs
+    .filter((m) => m.content.trim() || (m.role === "user" && m.images?.length))
+    .map((m) => ({ role: m.role, content: m.content, images: m.images }));
 }
 
 export default function ChatApp() {
@@ -71,8 +86,10 @@ export default function ChatApp() {
   const [model, setModel] = useState<ModelId>(DEFAULT_MODEL);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [theme, setTheme] = useState<"light" | "dark">("dark");
+  const [webSearch, setWebSearch] = useState(false);
 
   const [input, setInput] = useState("");
+  const [attachments, setAttachments] = useState<ImageData[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
@@ -81,6 +98,13 @@ export default function ChatApp() {
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  // Keep volatile values available to async callbacks without re-creating them.
+  const webRef = useRef(webSearch);
+  webRef.current = webSearch;
+  const systemRef = useRef(systemPrompt);
+  systemRef.current = systemPrompt;
 
   const active = useMemo(
     () => conversations.find((c) => c.id === activeId) ?? null,
@@ -98,6 +122,8 @@ export default function ChatApp() {
       if (m) setModel(JSON.parse(m));
       const sys = localStorage.getItem(STORAGE.system);
       if (sys) setSystemPrompt(JSON.parse(sys));
+      const w = localStorage.getItem(STORAGE.web);
+      if (w) setWebSearch(JSON.parse(w));
       const t = (localStorage.getItem(STORAGE.theme) as "light" | "dark") || "dark";
       setTheme(t === "light" ? "light" : "dark");
     } catch {
@@ -109,7 +135,11 @@ export default function ChatApp() {
   /* ---------- persist ---------- */
   useEffect(() => {
     if (!hydrated) return;
-    localStorage.setItem(STORAGE.conversations, JSON.stringify(conversations));
+    try {
+      localStorage.setItem(STORAGE.conversations, JSON.stringify(conversations));
+    } catch {
+      /* storage full (likely large images) — keep running without persisting */
+    }
   }, [conversations, hydrated]);
   useEffect(() => {
     if (!hydrated) return;
@@ -123,6 +153,10 @@ export default function ChatApp() {
     if (!hydrated) return;
     localStorage.setItem(STORAGE.system, JSON.stringify(systemPrompt));
   }, [systemPrompt, hydrated]);
+  useEffect(() => {
+    if (!hydrated) return;
+    localStorage.setItem(STORAGE.web, JSON.stringify(webSearch));
+  }, [webSearch, hydrated]);
   useEffect(() => {
     if (!hydrated) return;
     localStorage.setItem(STORAGE.theme, theme);
@@ -169,7 +203,7 @@ export default function ChatApp() {
     async (
       convId: string,
       assistantId: string,
-      apiMessages: { role: "user" | "assistant"; content: string }[],
+      apiMessages: ApiMessage[],
       useModel: ModelId,
     ) => {
       setIsStreaming(true);
@@ -182,7 +216,8 @@ export default function ChatApp() {
           body: JSON.stringify({
             messages: apiMessages,
             model: useModel,
-            system: systemPrompt,
+            system: systemRef.current,
+            webSearch: webRef.current,
           }),
           signal: controller.signal,
         });
@@ -195,10 +230,7 @@ export default function ChatApp() {
           } catch {
             /* non-JSON */
           }
-          updateMessage(convId, assistantId, () => ({
-            content: msg,
-            error: true,
-          }));
+          updateMessage(convId, assistantId, () => ({ content: msg, error: true }));
           return;
         }
 
@@ -242,21 +274,23 @@ export default function ChatApp() {
         abortRef.current = null;
       }
     },
-    [systemPrompt, updateMessage],
+    [updateMessage],
   );
 
   const send = useCallback(
     (raw: string) => {
       const text = raw.trim();
-      if (!text || isStreaming) return;
+      const imgs = attachments;
+      if ((!text && imgs.length === 0) || isStreaming) return;
 
       const conv = conversations.find((c) => c.id === activeId) ?? null;
-      const userMsg: ChatMessage = { id: uid(), role: "user", content: text };
-      const assistantMsg: ChatMessage = {
+      const userMsg: ChatMessage = {
         id: uid(),
-        role: "assistant",
-        content: "",
+        role: "user",
+        content: text,
+        images: imgs.length ? imgs : undefined,
       };
+      const assistantMsg: ChatMessage = { id: uid(), role: "assistant", content: "" };
       const priorMessages = conv ? conv.messages : [];
       const useModel = conv ? conv.model : model;
       const convId = conv ? conv.id : uid();
@@ -273,7 +307,7 @@ export default function ChatApp() {
       } else {
         const newConv: Conversation = {
           id: convId,
-          title: deriveTitle(text),
+          title: deriveTitle(text || "Image"),
           messages: newMessages,
           model: useModel,
           createdAt: Date.now(),
@@ -283,14 +317,16 @@ export default function ChatApp() {
         setActiveId(convId);
       }
       setInput("");
+      setAttachments([]);
 
-      const apiMessages = [...priorMessages, userMsg].map((m) => ({
-        role: m.role,
-        content: m.content,
-      }));
-      void streamResponse(convId, assistantMsg.id, apiMessages, useModel);
+      void streamResponse(
+        convId,
+        assistantMsg.id,
+        toApi([...priorMessages, userMsg]),
+        useModel,
+      );
     },
-    [activeId, conversations, isStreaming, model, streamResponse],
+    [activeId, attachments, conversations, isStreaming, model, streamResponse],
   );
 
   const regenerate = useCallback(() => {
@@ -300,30 +336,57 @@ export default function ChatApp() {
     while (i >= 0 && msgs[i].role !== "assistant") i--;
     if (i < 0) return;
     const priorMessages = msgs.slice(0, i);
-    const assistantMsg: ChatMessage = {
-      id: uid(),
-      role: "assistant",
-      content: "",
-    };
-    const newMessages = [...priorMessages, assistantMsg];
+    const assistantMsg: ChatMessage = { id: uid(), role: "assistant", content: "" };
     setConversations((prev) =>
       prev.map((c) =>
         c.id === active.id
-          ? { ...c, messages: newMessages, updatedAt: Date.now() }
+          ? { ...c, messages: [...priorMessages, assistantMsg], updatedAt: Date.now() }
           : c,
       ),
     );
-    const apiMessages = priorMessages
-      .filter((m) => m.content.trim())
-      .map((m) => ({ role: m.role, content: m.content }));
-    void streamResponse(active.id, assistantMsg.id, apiMessages, active.model);
+    void streamResponse(active.id, assistantMsg.id, toApi(priorMessages), active.model);
   }, [active, isStreaming, streamResponse]);
+
+  const editAndResend = useCallback(
+    (msgId: string, newText: string) => {
+      if (!active || isStreaming) return;
+      const idx = active.messages.findIndex((m) => m.id === msgId);
+      if (idx < 0) return;
+      const priorMessages = active.messages.slice(0, idx);
+      const original = active.messages[idx];
+      const editedUser: ChatMessage = {
+        ...original,
+        id: uid(),
+        content: newText.trim(),
+      };
+      const assistantMsg: ChatMessage = { id: uid(), role: "assistant", content: "" };
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === active.id
+            ? {
+                ...c,
+                messages: [...priorMessages, editedUser, assistantMsg],
+                updatedAt: Date.now(),
+              }
+            : c,
+        ),
+      );
+      void streamResponse(
+        active.id,
+        assistantMsg.id,
+        toApi([...priorMessages, editedUser]),
+        active.model,
+      );
+    },
+    [active, isStreaming, streamResponse],
+  );
 
   const stop = () => abortRef.current?.abort();
 
   const newChat = () => {
     if (isStreaming) return;
     setActiveId(null);
+    setAttachments([]);
     setSidebarOpen(false);
     setTimeout(() => textareaRef.current?.focus(), 50);
   };
@@ -343,9 +406,7 @@ export default function ChatApp() {
     const next = window.prompt("Rename chat", current?.title ?? "");
     if (next == null) return;
     setConversations((prev) =>
-      prev.map((c) =>
-        c.id === id ? { ...c, title: next.trim() || c.title } : c,
-      ),
+      prev.map((c) => (c.id === id ? { ...c, title: next.trim() || c.title } : c)),
     );
   };
 
@@ -358,11 +419,45 @@ export default function ChatApp() {
       );
   };
 
+  const onFiles = async (files: FileList | null) => {
+    if (!files) return;
+    const slots = MAX_ATTACHMENTS - attachments.length;
+    const picked = Array.from(files)
+      .filter((f) => ALLOWED_IMAGE_TYPES.has(f.type))
+      .slice(0, Math.max(0, slots));
+    for (const f of picked) {
+      try {
+        const img = await fileToImageData(f);
+        setAttachments((prev) => [...prev, img]);
+      } catch {
+        /* skip unreadable image */
+      }
+    }
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  const exportConversation = () => {
+    if (!active) return;
+    const lines = [`# ${active.title}`, ""];
+    for (const m of active.messages) {
+      lines.push(m.role === "user" ? "## You" : "## Lumio");
+      if (m.images?.length) lines.push(`_(${m.images.length} image attachment(s))_`);
+      lines.push(m.content || "", "");
+    }
+    const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${active.title.replace(/[^\w\- ]+/g, "").slice(0, 40) || "lumio-chat"}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const activeModelId: ModelId = active ? active.model : model;
+  const canSend = (input.trim().length > 0 || attachments.length > 0) && !isStreaming;
 
   return (
     <div className="flex h-[100dvh] w-full overflow-hidden bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-      {/* Mobile backdrop */}
       {sidebarOpen && (
         <div
           className="fixed inset-0 z-30 bg-black/40 backdrop-blur-sm md:hidden"
@@ -463,7 +558,6 @@ export default function ChatApp() {
             <Menu size={20} />
           </button>
 
-          {/* Model selector */}
           <div className="relative">
             <button
               onClick={() => setModelMenuOpen((v) => !v)}
@@ -475,25 +569,17 @@ export default function ChatApp() {
             </button>
             {modelMenuOpen && (
               <>
-                <div
-                  className="fixed inset-0 z-10"
-                  onClick={() => setModelMenuOpen(false)}
-                />
+                <div className="fixed inset-0 z-10" onClick={() => setModelMenuOpen(false)} />
                 <div className="absolute left-0 top-full z-20 mt-1 w-72 rounded-xl border border-zinc-200 bg-white p-1.5 shadow-xl dark:border-zinc-700 dark:bg-zinc-800">
                   {MODELS.map((m) => (
                     <button
                       key={m.id}
                       onClick={() => changeModel(m.id)}
                       className={`flex w-full items-start gap-2 rounded-lg px-2.5 py-2 text-left transition hover:bg-zinc-100 dark:hover:bg-zinc-700/60 ${
-                        m.id === activeModelId
-                          ? "bg-zinc-100 dark:bg-zinc-700/60"
-                          : ""
+                        m.id === activeModelId ? "bg-zinc-100 dark:bg-zinc-700/60" : ""
                       }`}
                     >
-                      <Sparkles
-                        size={15}
-                        className="mt-0.5 shrink-0 text-violet-500"
-                      />
+                      <Sparkles size={15} className="mt-0.5 shrink-0 text-violet-500" />
                       <span className="min-w-0">
                         <span className="flex items-center gap-2 text-sm font-medium">
                           {m.name}
@@ -514,6 +600,16 @@ export default function ChatApp() {
 
           <div className="flex-1" />
 
+          {active && active.messages.length > 0 && (
+            <button
+              onClick={exportConversation}
+              className="rounded-md p-2 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+              aria-label="Export conversation as Markdown"
+              title="Export as Markdown"
+            >
+              <Download size={18} />
+            </button>
+          )}
           <button
             onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
             className="rounded-md p-2 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
@@ -533,6 +629,8 @@ export default function ChatApp() {
                 <MessageBubble
                   key={m.id}
                   message={m}
+                  canEdit={!isStreaming}
+                  onResend={editAndResend}
                   streaming={
                     isStreaming &&
                     m.role === "assistant" &&
@@ -560,7 +658,62 @@ export default function ChatApp() {
         {/* Composer */}
         <div className="border-t border-zinc-200 px-3 py-3 dark:border-zinc-800">
           <div className="mx-auto w-full max-w-3xl">
+            {attachments.length > 0 && (
+              <div className="mb-2 flex flex-wrap gap-2">
+                {attachments.map((img, i) => (
+                  <div key={i} className="relative">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={imageSrc(img)}
+                      alt="attachment"
+                      className="h-16 w-16 rounded-lg border border-zinc-300 object-cover dark:border-zinc-700"
+                    />
+                    <button
+                      onClick={() =>
+                        setAttachments((prev) => prev.filter((_, j) => j !== i))
+                      }
+                      className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-zinc-800 text-white shadow hover:bg-zinc-700"
+                      aria-label="Remove image"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <div className="flex items-end gap-2 rounded-2xl border border-zinc-300 bg-white p-2 shadow-sm transition focus-within:border-violet-400 focus-within:ring-2 focus-within:ring-violet-200 dark:border-zinc-700 dark:bg-zinc-900 dark:focus-within:border-violet-500/60 dark:focus-within:ring-violet-500/20">
+              <input
+                ref={fileRef}
+                type="file"
+                accept="image/png,image/jpeg,image/gif,image/webp"
+                multiple
+                className="hidden"
+                onChange={(e) => void onFiles(e.target.files)}
+              />
+              <button
+                onClick={() => fileRef.current?.click()}
+                disabled={attachments.length >= MAX_ATTACHMENTS}
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-zinc-500 transition hover:bg-zinc-100 disabled:opacity-40 dark:hover:bg-zinc-800"
+                aria-label="Attach image"
+                title="Attach image"
+              >
+                <Paperclip size={18} />
+              </button>
+              <button
+                onClick={() => setWebSearch((v) => !v)}
+                className={`flex h-9 shrink-0 items-center gap-1.5 rounded-xl px-2.5 text-sm transition ${
+                  webSearch
+                    ? "bg-violet-100 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300"
+                    : "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                }`}
+                aria-pressed={webSearch}
+                title="Toggle web search"
+              >
+                <Globe size={17} />
+                <span className="hidden sm:inline">Search</span>
+              </button>
+
               <textarea
                 ref={textareaRef}
                 value={input}
@@ -575,6 +728,7 @@ export default function ChatApp() {
                 placeholder="Message Lumio…"
                 className="max-h-[200px] flex-1 resize-none bg-transparent px-2 py-1.5 text-[0.95rem] outline-none placeholder:text-zinc-400"
               />
+
               {isStreaming ? (
                 <button
                   onClick={stop}
@@ -586,7 +740,7 @@ export default function ChatApp() {
               ) : (
                 <button
                   onClick={() => send(input)}
-                  disabled={!input.trim()}
+                  disabled={!canSend}
                   className="lumio-gradient flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-white transition disabled:cursor-not-allowed disabled:opacity-40"
                   aria-label="Send message"
                 >
@@ -625,8 +779,8 @@ function EmptyState({ onPick }: { onPick: (prompt: string) => void }) {
         Meet <span className="lumio-gradient-text">Lumio</span>
       </h1>
       <p className="mt-2 max-w-md text-zinc-500 dark:text-zinc-400">
-        Your AI companion for thinking, writing, coding, and getting things
-        done. What can I help you with today?
+        Your AI companion for thinking, writing, coding, and getting things done.
+        What can I help you with today?
       </p>
       <div className="mt-8 grid w-full grid-cols-1 gap-3 sm:grid-cols-2">
         {SUGGESTIONS.map((s) => (
@@ -649,11 +803,17 @@ function EmptyState({ onPick }: { onPick: (prompt: string) => void }) {
 function MessageBubble({
   message,
   streaming,
+  canEdit,
+  onResend,
 }: {
   message: ChatMessage;
   streaming: boolean;
+  canEdit: boolean;
+  onResend: (id: string, text: string) => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(message.content);
   const isUser = message.role === "user";
 
   const copy = async () => {
@@ -668,10 +828,73 @@ function MessageBubble({
 
   if (isUser) {
     return (
-      <div className="mb-6 flex justify-end">
-        <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-violet-600 px-4 py-2.5 text-[0.95rem] text-white">
-          {message.content}
-        </div>
+      <div className="group mb-6 flex flex-col items-end">
+        {message.images?.length ? (
+          <div className="mb-1.5 flex flex-wrap justify-end gap-2">
+            {message.images.map((img, i) => (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                key={i}
+                src={imageSrc(img)}
+                alt="attachment"
+                className="max-h-48 rounded-xl border border-zinc-200 object-cover dark:border-zinc-700"
+              />
+            ))}
+          </div>
+        ) : null}
+
+        {editing ? (
+          <div className="w-full max-w-[85%]">
+            <textarea
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              rows={3}
+              className="w-full resize-none rounded-xl border border-violet-300 bg-white p-3 text-sm outline-none focus:ring-2 focus:ring-violet-200 dark:border-violet-500/50 dark:bg-zinc-800 dark:focus:ring-violet-500/20"
+            />
+            <div className="mt-1.5 flex justify-end gap-2">
+              <button
+                onClick={() => {
+                  setEditing(false);
+                  setDraft(message.content);
+                }}
+                className="rounded-lg px-3 py-1.5 text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  if (draft.trim()) {
+                    setEditing(false);
+                    onResend(message.id, draft);
+                  }
+                }}
+                className="lumio-gradient rounded-lg px-3 py-1.5 text-xs font-medium text-white"
+              >
+                Send
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            {message.content && (
+              <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-violet-600 px-4 py-2.5 text-[0.95rem] text-white">
+                {message.content}
+              </div>
+            )}
+            {canEdit && (
+              <button
+                onClick={() => {
+                  setDraft(message.content);
+                  setEditing(true);
+                }}
+                className="mt-1 flex items-center gap-1 rounded-lg px-2 py-0.5 text-xs text-zinc-400 opacity-0 transition hover:bg-zinc-100 hover:text-zinc-700 group-hover:opacity-100 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+              >
+                <Pencil size={12} />
+                Edit
+              </button>
+            )}
+          </>
+        )}
       </div>
     );
   }
@@ -740,8 +963,8 @@ function SettingsModal({
           </button>
         </div>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          Tell Lumio how you&apos;d like it to respond. This is added to every
-          new message.
+          Tell Lumio how you&apos;d like it to respond. This is added to every new
+          message.
         </p>
         <textarea
           value={draft}

@@ -7,17 +7,44 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 const VALID_MODELS = new Set(MODELS.map((m) => m.id));
+const ALLOWED_MEDIA = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
 
 const DEFAULT_SYSTEM =
   "You are Lumio, a friendly, knowledgeable AI assistant created to help people " +
   "think, write, learn, and build. Be clear, accurate, and genuinely helpful. " +
   "Use Markdown for structure: headings, bullet points, tables, and fenced code " +
   "blocks with a language tag when sharing code. Be concise by default and expand " +
-  "when the task calls for depth.";
+  "when the task calls for depth. When you use web search results, cite the sources.";
 
+// --- Best-effort in-memory rate limit (per warm serverless instance) ---
+const WINDOW_MS = 60_000;
+const MAX_PER_WINDOW = 30;
+const buckets = new Map<string, { count: number; reset: number }>();
+
+function rateLimited(ip: string): boolean {
+  const now = Date.now();
+  let b = buckets.get(ip);
+  if (!b || b.reset < now) {
+    b = { count: 0, reset: now + WINDOW_MS };
+    buckets.set(ip, b);
+  }
+  b.count += 1;
+  return b.count > MAX_PER_WINDOW;
+}
+
+interface IncomingImage {
+  mediaType: string;
+  data: string;
+}
 interface IncomingMessage {
   role: "user" | "assistant";
   content: string;
+  images?: IncomingImage[];
 }
 
 export async function POST(req: Request) {
@@ -32,26 +59,74 @@ export async function POST(req: Request) {
     );
   }
 
-  let body: { messages?: IncomingMessage[]; model?: string; system?: string };
+  const ip =
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    req.headers.get("x-real-ip") ||
+    "unknown";
+  if (rateLimited(ip)) {
+    return Response.json(
+      { error: "You're sending messages too quickly. Please wait a moment." },
+      { status: 429 },
+    );
+  }
+
+  let body: {
+    messages?: IncomingMessage[];
+    model?: string;
+    system?: string;
+    webSearch?: boolean;
+  };
   try {
     body = await req.json();
   } catch {
     return Response.json({ error: "Invalid request body." }, { status: 400 });
   }
 
-  const messages = (body.messages ?? [])
-    .filter(
-      (m): m is IncomingMessage =>
-        !!m &&
-        (m.role === "user" || m.role === "assistant") &&
-        typeof m.content === "string" &&
-        m.content.trim().length > 0,
-    )
-    .map((m) => ({ role: m.role, content: m.content }));
+  const raw = (body.messages ?? []).filter(
+    (m): m is IncomingMessage =>
+      !!m &&
+      (m.role === "user" || m.role === "assistant") &&
+      typeof m.content === "string" &&
+      (m.content.trim().length > 0 ||
+        (m.role === "user" &&
+          Array.isArray(m.images) &&
+          m.images.length > 0)),
+  );
 
-  if (messages.length === 0) {
+  if (raw.length === 0) {
     return Response.json({ error: "No messages provided." }, { status: 400 });
   }
+
+  const messages: Anthropic.MessageParam[] = raw.map((m) => {
+    const images = (m.images ?? []).filter(
+      (img) =>
+        img &&
+        ALLOWED_MEDIA.has(img.mediaType) &&
+        typeof img.data === "string" &&
+        img.data.length > 0,
+    );
+    if (m.role === "user" && images.length > 0) {
+      const blocks: Anthropic.ContentBlockParam[] = [
+        ...images.map(
+          (img): Anthropic.ImageBlockParam => ({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: img.mediaType as
+                | "image/jpeg"
+                | "image/png"
+                | "image/gif"
+                | "image/webp",
+              data: img.data,
+            },
+          }),
+        ),
+      ];
+      if (m.content.trim()) blocks.push({ type: "text", text: m.content });
+      return { role: "user", content: blocks };
+    }
+    return { role: m.role, content: m.content };
+  });
 
   const model = VALID_MODELS.has(body.model as never)
     ? (body.model as string)
@@ -75,6 +150,16 @@ export async function POST(req: Request) {
           max_tokens: 8000,
           system,
           messages,
+          ...(body.webSearch
+            ? {
+                tools: [
+                  {
+                    type: "web_search_20260209",
+                    name: "web_search",
+                  } as unknown as Anthropic.ToolUnion,
+                ],
+              }
+            : {}),
         });
 
         for await (const event of run) {

@@ -7,4 +7,5 @@ export const STORAGE = {
   model: "lumio.model.v1",
   theme: "lumio.theme.v1",
   system: "lumio.system.v1",
+  web: "lumio.web.v1",
 } as const;
