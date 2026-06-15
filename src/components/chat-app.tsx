@@ -12,6 +12,9 @@ import {
   Copy,
   Download,
   Globe,
+  Link2,
+  LogIn,
+  LogOut,
   Menu,
   MessageSquarePlus,
   Moon,
@@ -20,6 +23,7 @@ import {
   RotateCcw,
   Send,
   Settings2,
+  Share2,
   Sparkles,
   Square,
   Sun,
@@ -36,6 +40,13 @@ import {
 } from "@/lib/models";
 import { ERROR_SENTINEL, STORAGE } from "@/lib/constants";
 import { ALLOWED_IMAGE_TYPES, fileToImageData, imageSrc } from "@/lib/image";
+import { cloudEnabled, supabase } from "@/lib/supabase";
+import {
+  deleteConversationCloud,
+  fetchConversations,
+  setPublic,
+  upsertConversations,
+} from "@/lib/cloud";
 import type { ChatMessage, Conversation, ImageData } from "@/lib/types";
 
 const uid = () =>
@@ -45,24 +56,10 @@ const uid = () =>
 const MAX_ATTACHMENTS = 4;
 
 const SUGGESTIONS = [
-  {
-    title: "Explain a concept",
-    prompt: "Explain how large language models work, in simple terms.",
-  },
-  {
-    title: "Write some code",
-    prompt:
-      "Write a Python function that returns the nth Fibonacci number, with comments.",
-  },
-  {
-    title: "Draft an email",
-    prompt:
-      "Draft a friendly email asking my team to submit their weekly updates by Friday.",
-  },
-  {
-    title: "Plan something",
-    prompt: "Give me a 3-day itinerary for a first trip to Tokyo.",
-  },
+  { title: "Explain a concept", prompt: "Explain how large language models work, in simple terms." },
+  { title: "Write some code", prompt: "Write a Python function that returns the nth Fibonacci number, with comments." },
+  { title: "Draft an email", prompt: "Draft a friendly email asking my team to submit their weekly updates by Friday." },
+  { title: "Plan something", prompt: "Give me a 3-day itinerary for a first trip to Tokyo." },
 ];
 
 function deriveTitle(text: string) {
@@ -77,6 +74,11 @@ function toApi(msgs: ChatMessage[]): ApiMessage[] {
   return msgs
     .filter((m) => m.content.trim() || (m.role === "user" && m.images?.length))
     .map((m) => ({ role: m.role, content: m.content, images: m.images }));
+}
+
+interface AccountUser {
+  id: string;
+  email: string | null;
 }
 
 export default function ChatApp() {
@@ -95,21 +97,36 @@ export default function ChatApp() {
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
+  const [user, setUser] = useState<AccountUser | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  // Keep volatile values available to async callbacks without re-creating them.
   const webRef = useRef(webSearch);
   webRef.current = webSearch;
   const systemRef = useRef(systemPrompt);
   systemRef.current = systemPrompt;
+  const convsRef = useRef<Conversation[]>([]);
+  convsRef.current = conversations;
+  const userRef = useRef<AccountUser | null>(null);
+  userRef.current = user;
+  const syncedRef = useRef<Record<string, number>>({});
+  const syncedUserRef = useRef<string | null>(null);
 
   const active = useMemo(
     () => conversations.find((c) => c.id === activeId) ?? null,
     [conversations, activeId],
   );
+
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast((t) => (t === msg ? null : t)), 2600);
+  }, []);
 
   /* ---------- load persisted state ---------- */
   useEffect(() => {
@@ -132,7 +149,60 @@ export default function ChatApp() {
     setHydrated(true);
   }, []);
 
-  /* ---------- persist ---------- */
+  /* ---------- cloud auth + initial sync ---------- */
+  const initialSync = useCallback(async (userId: string) => {
+    // Push any local conversations up to the account, then make the cloud the
+    // source of truth for this device.
+    const local = convsRef.current;
+    if (local.length) await upsertConversations(local, userId);
+    const cloud = await fetchConversations(userId);
+    syncedRef.current = {};
+    for (const c of cloud) syncedRef.current[c.id] = c.updatedAt;
+    setConversations(cloud);
+  }, []);
+
+  useEffect(() => {
+    if (!supabase) return;
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      const u = session?.user ?? null;
+      setUser(u ? { id: u.id, email: u.email ?? null } : null);
+      if (u && syncedUserRef.current !== u.id) {
+        syncedUserRef.current = u.id;
+        void initialSync(u.id);
+      } else if (!u) {
+        syncedUserRef.current = null;
+        syncedRef.current = {};
+      }
+    });
+    return () => sub.subscription.unsubscribe();
+  }, [initialSync]);
+
+  /* ---------- push local changes to cloud (debounced) ---------- */
+  useEffect(() => {
+    if (!user || !cloudEnabled || isStreaming) return;
+    const changed = conversations.filter(
+      (c) => syncedRef.current[c.id] !== c.updatedAt,
+    );
+    if (changed.length === 0) return;
+    const id = userRef.current?.id;
+    if (!id) return;
+    const handle = setTimeout(() => {
+      void upsertConversations(changed, id).then((saved) => {
+        for (const c of changed) syncedRef.current[c.id] = c.updatedAt;
+        if (saved.length) {
+          setConversations((prev) =>
+            prev.map((p) => {
+              const s = saved.find((r) => r.id === p.id);
+              return s ? { ...p, shareId: s.shareId, isPublic: s.isPublic } : p;
+            }),
+          );
+        }
+      });
+    }, 1200);
+    return () => clearTimeout(handle);
+  }, [conversations, user, isStreaming]);
+
+  /* ---------- persist locally ---------- */
   useEffect(() => {
     if (!hydrated) return;
     try {
@@ -142,20 +212,16 @@ export default function ChatApp() {
     }
   }, [conversations, hydrated]);
   useEffect(() => {
-    if (!hydrated) return;
-    localStorage.setItem(STORAGE.activeId, JSON.stringify(activeId));
+    if (hydrated) localStorage.setItem(STORAGE.activeId, JSON.stringify(activeId));
   }, [activeId, hydrated]);
   useEffect(() => {
-    if (!hydrated) return;
-    localStorage.setItem(STORAGE.model, JSON.stringify(model));
+    if (hydrated) localStorage.setItem(STORAGE.model, JSON.stringify(model));
   }, [model, hydrated]);
   useEffect(() => {
-    if (!hydrated) return;
-    localStorage.setItem(STORAGE.system, JSON.stringify(systemPrompt));
+    if (hydrated) localStorage.setItem(STORAGE.system, JSON.stringify(systemPrompt));
   }, [systemPrompt, hydrated]);
   useEffect(() => {
-    if (!hydrated) return;
-    localStorage.setItem(STORAGE.web, JSON.stringify(webSearch));
+    if (hydrated) localStorage.setItem(STORAGE.web, JSON.stringify(webSearch));
   }, [webSearch, hydrated]);
   useEffect(() => {
     if (!hydrated) return;
@@ -258,9 +324,7 @@ export default function ChatApp() {
         }
       } catch (err) {
         if (controller.signal.aborted) {
-          updateMessage(convId, assistantId, (m) => ({
-            content: m.content || "_Stopped._",
-          }));
+          updateMessage(convId, assistantId, (m) => ({ content: m.content || "_Stopped._" }));
         } else {
           updateMessage(convId, assistantId, (m) => ({
             content:
@@ -299,9 +363,7 @@ export default function ChatApp() {
       if (conv) {
         setConversations((prev) =>
           prev.map((c) =>
-            c.id === convId
-              ? { ...c, messages: newMessages, updatedAt: Date.now() }
-              : c,
+            c.id === convId ? { ...c, messages: newMessages, updatedAt: Date.now() } : c,
           ),
         );
       } else {
@@ -319,12 +381,7 @@ export default function ChatApp() {
       setInput("");
       setAttachments([]);
 
-      void streamResponse(
-        convId,
-        assistantMsg.id,
-        toApi([...priorMessages, userMsg]),
-        useModel,
-      );
+      void streamResponse(convId, assistantMsg.id, toApi([...priorMessages, userMsg]), useModel);
     },
     [activeId, attachments, conversations, isStreaming, model, streamResponse],
   );
@@ -354,20 +411,12 @@ export default function ChatApp() {
       if (idx < 0) return;
       const priorMessages = active.messages.slice(0, idx);
       const original = active.messages[idx];
-      const editedUser: ChatMessage = {
-        ...original,
-        id: uid(),
-        content: newText.trim(),
-      };
+      const editedUser: ChatMessage = { ...original, id: uid(), content: newText.trim() };
       const assistantMsg: ChatMessage = { id: uid(), role: "assistant", content: "" };
       setConversations((prev) =>
         prev.map((c) =>
           c.id === active.id
-            ? {
-                ...c,
-                messages: [...priorMessages, editedUser, assistantMsg],
-                updatedAt: Date.now(),
-              }
+            ? { ...c, messages: [...priorMessages, editedUser, assistantMsg], updatedAt: Date.now() }
             : c,
         ),
       );
@@ -398,6 +447,8 @@ export default function ChatApp() {
 
   const deleteConversation = (id: string) => {
     setConversations((prev) => prev.filter((c) => c.id !== id));
+    delete syncedRef.current[id];
+    if (user) void deleteConversationCloud(id);
     if (activeId === id) setActiveId(null);
   };
 
@@ -406,7 +457,9 @@ export default function ChatApp() {
     const next = window.prompt("Rename chat", current?.title ?? "");
     if (next == null) return;
     setConversations((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, title: next.trim() || c.title } : c)),
+      prev.map((c) =>
+        c.id === id ? { ...c, title: next.trim() || c.title, updatedAt: Date.now() } : c,
+      ),
     );
   };
 
@@ -415,7 +468,7 @@ export default function ChatApp() {
     setModelMenuOpen(false);
     if (active)
       setConversations((prev) =>
-        prev.map((c) => (c.id === active.id ? { ...c, model: id } : c)),
+        prev.map((c) => (c.id === active.id ? { ...c, model: id, updatedAt: Date.now() } : c)),
       );
   };
 
@@ -451,6 +504,46 @@ export default function ChatApp() {
     a.download = `${active.title.replace(/[^\w\- ]+/g, "").slice(0, 40) || "lumio-chat"}.md`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  /* ---------- sharing ---------- */
+  const makePublic = async () => {
+    if (!active || !user) return;
+    await upsertConversations([active], user.id);
+    const shareId = await setPublic(active.id, true);
+    if (shareId) {
+      setConversations((prev) =>
+        prev.map((c) => (c.id === active.id ? { ...c, isPublic: true, shareId } : c)),
+      );
+      const link = `${location.origin}/share/${shareId}`;
+      await navigator.clipboard.writeText(link).catch(() => {});
+      showToast("Public link copied to clipboard");
+    } else {
+      showToast("Could not create share link");
+    }
+  };
+
+  const stopSharing = async () => {
+    if (!active) return;
+    await setPublic(active.id, false);
+    setConversations((prev) =>
+      prev.map((c) => (c.id === active.id ? { ...c, isPublic: false } : c)),
+    );
+    setShareOpen(false);
+    showToast("Sharing turned off");
+  };
+
+  const copyShareLink = async () => {
+    if (!active?.shareId) return;
+    await navigator.clipboard
+      .writeText(`${location.origin}/share/${active.shareId}`)
+      .catch(() => {});
+    showToast("Link copied");
+  };
+
+  const signOut = async () => {
+    await supabase?.auth.signOut();
+    showToast("Signed out");
   };
 
   const activeModelId: ModelId = active ? active.model : model;
@@ -512,10 +605,11 @@ export default function ChatApp() {
             >
               <button
                 onClick={() => selectConversation(c.id)}
-                className="flex-1 truncate py-2 text-left text-sm"
+                className="flex flex-1 items-center gap-1.5 truncate py-2 text-left text-sm"
                 title={c.title}
               >
-                {c.title}
+                {c.isPublic && <Link2 size={12} className="shrink-0 text-violet-500" />}
+                <span className="truncate">{c.title}</span>
               </button>
               <button
                 onClick={() => renameConversation(c.id)}
@@ -535,7 +629,7 @@ export default function ChatApp() {
           ))}
         </div>
 
-        <div className="border-t border-zinc-200 p-3 dark:border-zinc-800">
+        <div className="space-y-1 border-t border-zinc-200 p-3 dark:border-zinc-800">
           <button
             onClick={() => setSettingsOpen(true)}
             className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-sm text-zinc-600 hover:bg-zinc-200/60 dark:text-zinc-300 dark:hover:bg-zinc-800"
@@ -543,12 +637,38 @@ export default function ChatApp() {
             <Settings2 size={16} />
             Custom instructions
           </button>
+          {cloudEnabled &&
+            (user ? (
+              <div className="flex items-center gap-2 rounded-lg px-2 py-1.5">
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-violet-100 text-xs font-semibold text-violet-700 dark:bg-violet-500/20 dark:text-violet-300">
+                  {(user.email ?? "?").slice(0, 1).toUpperCase()}
+                </div>
+                <span className="min-w-0 flex-1 truncate text-xs text-zinc-500 dark:text-zinc-400">
+                  {user.email}
+                </span>
+                <button
+                  onClick={signOut}
+                  className="rounded p-1 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                  aria-label="Sign out"
+                  title="Sign out"
+                >
+                  <LogOut size={15} />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setAuthOpen(true)}
+                className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-sm text-zinc-600 hover:bg-zinc-200/60 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                <LogIn size={16} />
+                Sign in to sync
+              </button>
+            ))}
         </div>
       </aside>
 
       {/* Main column */}
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* Header */}
         <header className="flex items-center gap-2 border-b border-zinc-200 px-3 py-2.5 dark:border-zinc-800">
           <button
             onClick={() => setSidebarOpen(true)}
@@ -599,6 +719,64 @@ export default function ChatApp() {
           </div>
 
           <div className="flex-1" />
+
+          {cloudEnabled && active && active.messages.length > 0 && (
+            <div className="relative">
+              <button
+                onClick={() => {
+                  if (!user) {
+                    setAuthOpen(true);
+                  } else if (active.isPublic) {
+                    setShareOpen((v) => !v);
+                  } else {
+                    void makePublic();
+                  }
+                }}
+                className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm transition ${
+                  active.isPublic
+                    ? "bg-violet-100 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300"
+                    : "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                }`}
+                title={user ? "Share conversation" : "Sign in to share"}
+              >
+                <Share2 size={16} />
+                <span className="hidden sm:inline">Share</span>
+              </button>
+              {shareOpen && active.isPublic && (
+                <>
+                  <div className="fixed inset-0 z-10" onClick={() => setShareOpen(false)} />
+                  <div className="absolute right-0 top-full z-20 mt-1 w-72 rounded-xl border border-zinc-200 bg-white p-3 shadow-xl dark:border-zinc-700 dark:bg-zinc-800">
+                    <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
+                      Anyone with this link can view this conversation.
+                    </p>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        readOnly
+                        value={
+                          active.shareId
+                            ? `${location.origin}/share/${active.shareId}`
+                            : ""
+                        }
+                        className="min-w-0 flex-1 truncate rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-xs dark:border-zinc-700 dark:bg-zinc-900"
+                      />
+                      <button
+                        onClick={copyShareLink}
+                        className="lumio-gradient rounded-lg px-2.5 py-1.5 text-xs font-medium text-white"
+                      >
+                        Copy
+                      </button>
+                    </div>
+                    <button
+                      onClick={stopSharing}
+                      className="mt-2 w-full rounded-lg px-2 py-1.5 text-left text-xs text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10"
+                    >
+                      Stop sharing
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           {active && active.messages.length > 0 && (
             <button
@@ -669,9 +847,7 @@ export default function ChatApp() {
                       className="h-16 w-16 rounded-lg border border-zinc-300 object-cover dark:border-zinc-700"
                     />
                     <button
-                      onClick={() =>
-                        setAttachments((prev) => prev.filter((_, j) => j !== i))
-                      }
+                      onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
                       className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-zinc-800 text-white shadow hover:bg-zinc-700"
                       aria-label="Remove image"
                     >
@@ -764,6 +940,14 @@ export default function ChatApp() {
             setSettingsOpen(false);
           }}
         />
+      )}
+
+      {authOpen && <AuthModal onClose={() => setAuthOpen(false)} onToast={showToast} />}
+
+      {toast && (
+        <div className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full bg-zinc-900 px-4 py-2 text-sm text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-900">
+          {toast}
+        </div>
       )}
     </div>
   );
@@ -928,6 +1112,126 @@ function MessageBubble({
             {copied ? "Copied" : "Copy"}
           </button>
         )}
+      </div>
+    </div>
+  );
+}
+
+function AuthModal({
+  onClose,
+  onToast,
+}: {
+  onClose: () => void;
+  onToast: (m: string) => void;
+}) {
+  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+
+  const submit = async () => {
+    if (!supabase || busy) return;
+    setError(null);
+    setInfo(null);
+    if (!email.trim() || password.length < 6) {
+      setError("Enter an email and a password of at least 6 characters.");
+      return;
+    }
+    setBusy(true);
+    try {
+      if (mode === "signup") {
+        const { data, error } = await supabase.auth.signUp({
+          email: email.trim(),
+          password,
+        });
+        if (error) setError(error.message);
+        else if (!data.session)
+          setInfo("Account created! Check your email to confirm, then sign in.");
+        else {
+          onToast("Welcome to Lumio");
+          onClose();
+        }
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({
+          email: email.trim(),
+          password,
+        });
+        if (error) setError(error.message);
+        else {
+          onToast("Signed in");
+          onClose();
+        }
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-sm rounded-2xl border border-zinc-200 bg-white p-6 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex flex-col items-center text-center">
+          <LumioMark size={44} />
+          <h2 className="mt-3 text-lg font-semibold">
+            {mode === "signin" ? "Welcome back" : "Create your account"}
+          </h2>
+          <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+            Sync your conversations across devices.
+          </p>
+        </div>
+
+        <div className="mt-5 space-y-2.5">
+          <input
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="you@example.com"
+            autoComplete="email"
+            className="w-full rounded-xl border border-zinc-300 bg-white px-3 py-2.5 text-sm outline-none focus:border-violet-400 focus:ring-2 focus:ring-violet-200 dark:border-zinc-700 dark:bg-zinc-800 dark:focus:ring-violet-500/20"
+          />
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && void submit()}
+            placeholder="Password (min 6 characters)"
+            autoComplete={mode === "signin" ? "current-password" : "new-password"}
+            className="w-full rounded-xl border border-zinc-300 bg-white px-3 py-2.5 text-sm outline-none focus:border-violet-400 focus:ring-2 focus:ring-violet-200 dark:border-zinc-700 dark:bg-zinc-800 dark:focus:ring-violet-500/20"
+          />
+        </div>
+
+        {error && <p className="mt-2 text-xs text-red-500">{error}</p>}
+        {info && <p className="mt-2 text-xs text-emerald-600 dark:text-emerald-400">{info}</p>}
+
+        <button
+          onClick={submit}
+          disabled={busy}
+          className="lumio-gradient mt-4 w-full rounded-xl py-2.5 text-sm font-medium text-white disabled:opacity-60"
+        >
+          {busy ? "Please wait…" : mode === "signin" ? "Sign in" : "Sign up"}
+        </button>
+
+        <p className="mt-3 text-center text-xs text-zinc-500 dark:text-zinc-400">
+          {mode === "signin" ? "New to Lumio?" : "Already have an account?"}{" "}
+          <button
+            onClick={() => {
+              setMode(mode === "signin" ? "signup" : "signin");
+              setError(null);
+              setInfo(null);
+            }}
+            className="font-medium text-violet-600 hover:underline dark:text-violet-400"
+          >
+            {mode === "signin" ? "Create an account" : "Sign in"}
+          </button>
+        </p>
       </div>
     </div>
   );

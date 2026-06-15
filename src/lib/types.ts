@@ -22,4 +22,6 @@ export interface Conversation {
   model: ModelId;
   createdAt: number;
   updatedAt: number;
+  shareId?: string;
+  isPublic?: boolean;
 }
