@@ -1,5 +1,7 @@
 # Lumio ✦
 
+🔗 **Live demo:** https://lumio-one-sepia.vercel.app
+
 **Lumio** is a polished, Claude-style AI chat app — your companion for thinking,
 writing, coding, and getting things done. Built with Next.js 16, React 19,
 Tailwind CSS v4, and the Anthropic Claude API with streaming responses.
