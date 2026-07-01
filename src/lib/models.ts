@@ -1,6 +1,6 @@
 export type ModelId =
   | "claude-opus-4-8"
-  | "claude-sonnet-4-6"
+  | "claude-sonnet-5"
   | "claude-haiku-4-5";
 
 export interface ModelInfo {
@@ -12,7 +12,7 @@ export interface ModelInfo {
 
 export const MODELS: ModelInfo[] = [
   {
-    id: "claude-sonnet-4-6",
+    id: "claude-sonnet-5",
     name: "Lumio Balanced",
     tagline: "Fast, smart, great for everyday tasks",
     badge: "Recommended",
@@ -31,7 +31,7 @@ export const MODELS: ModelInfo[] = [
   },
 ];
 
-export const DEFAULT_MODEL: ModelId = "claude-sonnet-4-6";
+export const DEFAULT_MODEL: ModelId = "claude-sonnet-5";
 
 export function getModel(id: string | undefined): ModelInfo {
   return MODELS.find((m) => m.id === id) ?? MODELS[0];

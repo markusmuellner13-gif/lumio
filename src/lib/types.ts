@@ -7,12 +7,21 @@ export interface ImageData {
   data: string; // base64 without the data-url prefix
 }
 
+export interface ToolResult {
+  tool: string;
+  stdout?: string;
+  stderr?: string;
+  returnCode?: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: Role;
   content: string;
   images?: ImageData[];
   error?: boolean;
+  thinking?: string;
+  toolResults?: ToolResult[];
 }
 
 export interface Conversation {
