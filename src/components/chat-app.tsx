@@ -8,7 +8,9 @@ import {
   useState,
 } from "react";
 import {
+  BrainCircuit,
   Check,
+  Code2,
   Copy,
   Download,
   Globe,
@@ -38,7 +40,7 @@ import {
   getModel,
   type ModelId,
 } from "@/lib/models";
-import { ERROR_SENTINEL, STORAGE } from "@/lib/constants";
+import { EFFORT_LEVELS, STORAGE, THINKING_CAPABLE_MODELS, type Effort } from "@/lib/constants";
 import { ALLOWED_IMAGE_TYPES, fileToImageData, imageSrc } from "@/lib/image";
 import { cloudEnabled, supabase } from "@/lib/supabase";
 import {
@@ -47,7 +49,8 @@ import {
   setPublic,
   upsertConversations,
 } from "@/lib/cloud";
-import type { ChatMessage, Conversation, ImageData } from "@/lib/types";
+import { addMemoryFact, clearMemory, fetchMemory, removeMemoryFact } from "@/lib/memory";
+import type { ChatMessage, Conversation, ImageData, ToolResult } from "@/lib/types";
 
 const uid = () =>
   globalThis.crypto?.randomUUID?.() ??
@@ -89,6 +92,10 @@ export default function ChatApp() {
   const [systemPrompt, setSystemPrompt] = useState("");
   const [theme, setTheme] = useState<"light" | "dark">("dark");
   const [webSearch, setWebSearch] = useState(false);
+  const [codeExecution, setCodeExecution] = useState(false);
+  const [thinking, setThinking] = useState(false);
+  const [effort, setEffort] = useState<Effort>("high");
+  const [memoryFacts, setMemoryFacts] = useState<string[]>([]);
 
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<ImageData[]>([]);
@@ -109,6 +116,14 @@ export default function ChatApp() {
 
   const webRef = useRef(webSearch);
   webRef.current = webSearch;
+  const codeExecRef = useRef(codeExecution);
+  codeExecRef.current = codeExecution;
+  const thinkingRef = useRef(thinking);
+  thinkingRef.current = thinking;
+  const effortRef = useRef(effort);
+  effortRef.current = effort;
+  const memoryRef = useRef(memoryFacts);
+  memoryRef.current = memoryFacts;
   const systemRef = useRef(systemPrompt);
   systemRef.current = systemPrompt;
   const convsRef = useRef<Conversation[]>([]);
@@ -141,6 +156,12 @@ export default function ChatApp() {
       if (sys) setSystemPrompt(JSON.parse(sys));
       const w = localStorage.getItem(STORAGE.web);
       if (w) setWebSearch(JSON.parse(w));
+      const ce = localStorage.getItem(STORAGE.codeExecution);
+      if (ce) setCodeExecution(JSON.parse(ce));
+      const th = localStorage.getItem(STORAGE.thinking);
+      if (th) setThinking(JSON.parse(th));
+      const ef = localStorage.getItem(STORAGE.effort);
+      if (ef && (EFFORT_LEVELS as string[]).includes(JSON.parse(ef))) setEffort(JSON.parse(ef));
       const t = (localStorage.getItem(STORAGE.theme) as "light" | "dark") || "dark";
       setTheme(t === "light" ? "light" : "dark");
     } catch {
@@ -169,9 +190,11 @@ export default function ChatApp() {
       if (u && syncedUserRef.current !== u.id) {
         syncedUserRef.current = u.id;
         void initialSync(u.id);
+        void fetchMemory(u.id).then(setMemoryFacts);
       } else if (!u) {
         syncedUserRef.current = null;
         syncedRef.current = {};
+        setMemoryFacts([]);
       }
     });
     return () => sub.subscription.unsubscribe();
@@ -223,6 +246,15 @@ export default function ChatApp() {
   useEffect(() => {
     if (hydrated) localStorage.setItem(STORAGE.web, JSON.stringify(webSearch));
   }, [webSearch, hydrated]);
+  useEffect(() => {
+    if (hydrated) localStorage.setItem(STORAGE.codeExecution, JSON.stringify(codeExecution));
+  }, [codeExecution, hydrated]);
+  useEffect(() => {
+    if (hydrated) localStorage.setItem(STORAGE.thinking, JSON.stringify(thinking));
+  }, [thinking, hydrated]);
+  useEffect(() => {
+    if (hydrated) localStorage.setItem(STORAGE.effort, JSON.stringify(effort));
+  }, [effort, hydrated]);
   useEffect(() => {
     if (!hydrated) return;
     localStorage.setItem(STORAGE.theme, theme);
@@ -276,6 +308,8 @@ export default function ChatApp() {
       const controller = new AbortController();
       abortRef.current = controller;
       try {
+        const userId = userRef.current?.id;
+        const rememberEnabled = cloudEnabled && !!userId;
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -284,6 +318,11 @@ export default function ChatApp() {
             model: useModel,
             system: systemRef.current,
             webSearch: webRef.current,
+            codeExecution: codeExecRef.current,
+            thinking: thinkingRef.current,
+            effort: effortRef.current,
+            memory: memoryRef.current,
+            rememberEnabled,
           }),
           signal: controller.signal,
         });
@@ -303,24 +342,56 @@ export default function ChatApp() {
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let acc = "";
+        let thinkingAcc = "";
+        let toolResults: ToolResult[] = [];
+        let buffer = "";
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          acc += decoder.decode(value, { stream: true });
-          const errIdx = acc.indexOf(ERROR_SENTINEL);
-          if (errIdx !== -1) {
-            const before = acc.slice(0, errIdx).trimEnd();
-            const errMsg = acc.slice(errIdx + ERROR_SENTINEL.length);
-            updateMessage(convId, assistantId, () => ({
-              content:
-                (before ? before + "\n\n" : "") +
-                "⚠️ " +
-                (errMsg || "The model could not complete this response."),
-              error: true,
-            }));
-            return;
+          buffer += decoder.decode(value, { stream: true });
+          let idx: number;
+          while ((idx = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 1);
+            if (!line.trim()) continue;
+            let evt: Record<string, unknown>;
+            try {
+              evt = JSON.parse(line);
+            } catch {
+              continue;
+            }
+            if (evt.type === "text") {
+              acc += evt.text as string;
+              updateMessage(convId, assistantId, () => ({ content: acc }));
+            } else if (evt.type === "thinking") {
+              thinkingAcc += evt.text as string;
+              updateMessage(convId, assistantId, () => ({ thinking: thinkingAcc }));
+            } else if (evt.type === "tool_result") {
+              toolResults = [
+                ...toolResults,
+                {
+                  tool: evt.tool as string,
+                  stdout: evt.stdout as string | undefined,
+                  stderr: evt.stderr as string | undefined,
+                  returnCode: evt.returnCode as number | undefined,
+                },
+              ];
+              updateMessage(convId, assistantId, () => ({ toolResults }));
+            } else if (evt.type === "memory") {
+              const fact = evt.fact as string;
+              if (userId && fact) {
+                void addMemoryFact(userId, fact).then(setMemoryFacts);
+                showToast(`Remembered: ${fact}`);
+              }
+            } else if (evt.type === "error") {
+              const errMsg = (evt.message as string) || "The model could not complete this response.";
+              updateMessage(convId, assistantId, () => ({
+                content: (acc ? acc + "\n\n" : "") + "⚠️ " + errMsg,
+                error: true,
+              }));
+              return;
+            }
           }
-          updateMessage(convId, assistantId, () => ({ content: acc }));
         }
       } catch (err) {
         if (controller.signal.aborted) {
@@ -338,7 +409,7 @@ export default function ChatApp() {
         abortRef.current = null;
       }
     },
-    [updateMessage],
+    [updateMessage, showToast],
   );
 
   const send = useCallback(
@@ -877,7 +948,10 @@ export default function ChatApp() {
                 <Paperclip size={18} />
               </button>
               <button
-                onClick={() => setWebSearch((v) => !v)}
+                onClick={() => {
+                  setWebSearch((v) => !v);
+                  setCodeExecution(false);
+                }}
                 className={`flex h-9 shrink-0 items-center gap-1.5 rounded-xl px-2.5 text-sm transition ${
                   webSearch
                     ? "bg-violet-100 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300"
@@ -888,6 +962,42 @@ export default function ChatApp() {
               >
                 <Globe size={17} />
                 <span className="hidden sm:inline">Search</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setCodeExecution((v) => !v);
+                  setWebSearch(false);
+                }}
+                className={`hidden h-9 shrink-0 items-center gap-1.5 rounded-xl px-2.5 text-sm transition sm:flex ${
+                  codeExecution
+                    ? "bg-violet-100 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300"
+                    : "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                }`}
+                aria-pressed={codeExecution}
+                title="Toggle code execution (runs Python in a sandbox)"
+              >
+                <Code2 size={17} />
+                <span className="hidden md:inline">Code</span>
+              </button>
+
+              <button
+                onClick={() => setThinking((v) => !v)}
+                disabled={!THINKING_CAPABLE_MODELS.has(activeModelId)}
+                className={`hidden h-9 shrink-0 items-center gap-1.5 rounded-xl px-2.5 text-sm transition disabled:cursor-not-allowed disabled:opacity-40 sm:flex ${
+                  thinking
+                    ? "bg-violet-100 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300"
+                    : "text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                }`}
+                aria-pressed={thinking}
+                title={
+                  THINKING_CAPABLE_MODELS.has(activeModelId)
+                    ? "Toggle extended thinking"
+                    : "Extended thinking isn't available on this model"
+                }
+              >
+                <BrainCircuit size={17} />
+                <span className="hidden md:inline">Think</span>
               </button>
 
               <textarea
@@ -939,6 +1049,17 @@ export default function ChatApp() {
             setSystemPrompt(v);
             setSettingsOpen(false);
           }}
+          effort={effort}
+          onEffortChange={setEffort}
+          memoryFacts={cloudEnabled && user ? memoryFacts : null}
+          onForgetFact={(fact) => {
+            if (!user) return;
+            void removeMemoryFact(user.id, fact).then(setMemoryFacts);
+          }}
+          onClearMemory={() => {
+            if (!user) return;
+            void clearMemory(user.id).then(() => setMemoryFacts([]));
+          }}
         />
       )}
 
@@ -980,6 +1101,31 @@ function EmptyState({ onPick }: { onPick: (prompt: string) => void }) {
           </button>
         ))}
       </div>
+    </div>
+  );
+}
+
+function ThinkingBlock({ text, done }: { text: string; done: boolean }) {
+  const [open, setOpen] = useState(!done);
+  const [prevDone, setPrevDone] = useState(done);
+  if (done !== prevDone) {
+    setPrevDone(done);
+    if (done) setOpen(false);
+  }
+  return (
+    <div className="mb-2">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 rounded-lg px-1.5 py-1 text-xs text-zinc-400 transition hover:text-zinc-600 dark:hover:text-zinc-300"
+      >
+        <BrainCircuit size={13} />
+        {done ? "Thought process" : "Thinking…"}
+      </button>
+      {open && (
+        <div className="mt-1 whitespace-pre-wrap rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
+          {text}
+        </div>
+      )}
     </div>
   );
 }
@@ -1089,6 +1235,10 @@ function MessageBubble({
         <LumioMark size={28} />
       </div>
       <div className="min-w-0 flex-1">
+        {message.thinking && (
+          <ThinkingBlock text={message.thinking} done={!streaming || !!message.content} />
+        )}
+
         {message.content ? (
           message.error ? (
             <div className="rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-300">
@@ -1097,11 +1247,25 @@ function MessageBubble({
           ) : (
             <Markdown content={message.content} />
           )
-        ) : streaming ? (
+        ) : streaming && !message.thinking ? (
           <div className="flex items-center gap-1 py-1 text-zinc-400">
             <span className="lumio-caret">▍</span>
           </div>
         ) : null}
+
+        {message.toolResults?.map((tr, i) => (
+          <div
+            key={i}
+            className="mt-2 overflow-x-auto rounded-xl border border-zinc-200 bg-zinc-950 p-3 text-xs text-zinc-100 dark:border-zinc-700"
+          >
+            <div className="mb-1 flex items-center gap-1.5 text-zinc-400">
+              <Code2 size={12} />
+              <span>{tr.tool}{typeof tr.returnCode === "number" && tr.returnCode !== 0 ? ` (exit ${tr.returnCode})` : ""}</span>
+            </div>
+            {tr.stdout && <pre className="whitespace-pre-wrap">{tr.stdout}</pre>}
+            {tr.stderr && <pre className="whitespace-pre-wrap text-red-400">{tr.stderr}</pre>}
+          </div>
+        ))}
 
         {!streaming && message.content && !message.error && (
           <button
@@ -1241,10 +1405,20 @@ function SettingsModal({
   value,
   onClose,
   onSave,
+  effort,
+  onEffortChange,
+  memoryFacts,
+  onForgetFact,
+  onClearMemory,
 }: {
   value: string;
   onClose: () => void;
   onSave: (v: string) => void;
+  effort: Effort;
+  onEffortChange: (e: Effort) => void;
+  memoryFacts: string[] | null;
+  onForgetFact: (fact: string) => void;
+  onClearMemory: () => void;
 }) {
   const [draft, setDraft] = useState(value);
   return (
@@ -1277,6 +1451,70 @@ function SettingsModal({
           placeholder="e.g. I'm a beginner developer. Keep explanations simple and include examples."
           className="mt-3 w-full resize-none rounded-xl border border-zinc-300 bg-white p-3 text-sm outline-none focus:border-violet-400 focus:ring-2 focus:ring-violet-200 dark:border-zinc-700 dark:bg-zinc-800 dark:focus:ring-violet-500/20"
         />
+
+        <div className="mt-5 border-t border-zinc-200 pt-4 dark:border-zinc-800">
+          <h3 className="text-sm font-medium">Thinking effort</h3>
+          <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
+            How hard Lumio thinks before answering, when the Think toggle is on. Higher
+            effort is slower but more thorough.
+          </p>
+          <div className="mt-2 flex gap-2">
+            {EFFORT_LEVELS.map((lvl) => (
+              <button
+                key={lvl}
+                onClick={() => onEffortChange(lvl)}
+                className={`flex-1 rounded-lg border px-3 py-1.5 text-sm capitalize transition ${
+                  effort === lvl
+                    ? "border-violet-400 bg-violet-100 text-violet-700 dark:border-violet-500/60 dark:bg-violet-500/20 dark:text-violet-300"
+                    : "border-zinc-200 text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                }`}
+              >
+                {lvl}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {memoryFacts && (
+          <div className="mt-5 border-t border-zinc-200 pt-4 dark:border-zinc-800">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-medium">Memory</h3>
+              {memoryFacts.length > 0 && (
+                <button
+                  onClick={onClearMemory}
+                  className="text-xs text-zinc-400 hover:text-red-500"
+                >
+                  Clear all
+                </button>
+              )}
+            </div>
+            <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
+              Facts Lumio has remembered about you across conversations.
+            </p>
+            {memoryFacts.length === 0 ? (
+              <p className="mt-2 text-xs text-zinc-400">Nothing remembered yet.</p>
+            ) : (
+              <ul className="mt-2 max-h-32 space-y-1 overflow-y-auto">
+                {memoryFacts.map((fact) => (
+                  <li
+                    key={fact}
+                    className="flex items-start justify-between gap-2 rounded-lg bg-zinc-100 px-2.5 py-1.5 text-xs dark:bg-zinc-800"
+                  >
+                    <span className="min-w-0 break-words">{fact}</span>
+                    <button
+                      onClick={() => onForgetFact(fact)}
+                      className="shrink-0 text-zinc-400 hover:text-red-500"
+                      aria-label="Forget this"
+                    >
+                      <X size={13} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
         <div className="mt-4 flex justify-end gap-2">
           <button
             onClick={onClose}
